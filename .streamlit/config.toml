@@ -1,0 +1,14 @@
+[server]
+# Increase file upload size limit for large μ-law files
+maxUploadSize = 200
+
+[theme]
+# Optional: Custom theme
+primaryColor = "#1f77b4"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f2f6"
+textColor = "#262730"
+
+[browser]
+# Automatically open browser when running locally
+gatherUsageStats = false

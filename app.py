@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Enhanced μ-law to WAV Audio Converter and Transcriber - Streamlit Web Interface
-Handles large-scale batch processing with directory structure preservation and consolidated reporting.
+Enhanced μ-law to WAV Audio Converter and Transcriber - Streamlit Cloud Version
+Handles file uploads with batch processing and transcription capabilities.
 """
 
 import streamlit as st
@@ -23,9 +23,8 @@ import json
 from typing import List, Dict, Optional, Tuple
 import concurrent.futures
 from dataclasses import dataclass, asdict
-import pickle
 
-# Configure logging
+# Configure logging for in-memory logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -66,18 +65,16 @@ ULAW_TO_LINEAR = [
 ]
 
 @dataclass
-class ProcessingJob:
-    """Represents a single file processing job"""
-    file_path: Path
-    relative_path: Path
-    parent_folder: str
+class UploadedFileJob:
+    """Represents a single uploaded file processing job"""
     file_name: str
+    file_data: bytes
+    file_size: int
     status: str = "pending"
-    wav_path: Optional[Path] = None
+    wav_data: Optional[bytes] = None
     transcript: str = ""
     error_message: str = ""
     processing_time: float = 0.0
-    file_size: int = 0
 
 @dataclass
 class ProcessingStats:
@@ -92,89 +89,27 @@ class ProcessingStats:
     current_step: str = ""
     step_start_time: Optional[datetime] = None
 
-@dataclass
-class ProcessingSession:
-    """Tracks a processing session with persistent state"""
-    session_id: str
-    start_time: datetime
-    total_files: int
-    processed: int = 0
-    successful: int = 0
-    failed: int = 0
-    current_file: str = ""
-    is_active: bool = True
-    log_file: str = ""
-
-class PersistentLogger:
-    """Handles persistent logging that survives app restarts"""
+class InMemoryLogger:
+    """Handles in-memory logging for Streamlit Cloud"""
     
     def __init__(self, session_id: str):
         self.session_id = session_id
-        self.log_dir = Path("ulaw_logs")
-        self.log_dir.mkdir(exist_ok=True)
-        self.log_file = self.log_dir / f"session_{session_id}.log"
-        self.status_file = self.log_dir / f"session_{session_id}_status.json"
+        self.log_entries = []
+        self.max_entries = 1000  # Keep last 1000 log entries
         
-        # Setup file logger
-        self.logger = logging.getLogger(f"session_{session_id}")
-        self.logger.setLevel(logging.INFO)
-        
-        # Remove existing handlers
-        for handler in self.logger.handlers[:]:
-            self.logger.removeHandler(handler)
-        
-        # Add file handler
-        file_handler = logging.FileHandler(self.log_file, encoding='utf-8')
-        formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
-        file_handler.setFormatter(formatter)
-        self.logger.addHandler(file_handler)
-    
     def log(self, level: str, message: str):
-        """Log a message"""
+        """Log a message to memory"""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        if level == "INFO":
-            self.logger.info(message)
-        elif level == "ERROR":
-            self.logger.error(message)
-        elif level == "WARNING":
-            self.logger.warning(message)
-        elif level == "SUCCESS":
-            self.logger.info(f"✅ {message}")
+        entry = f"{timestamp} | {level} | {message}"
+        self.log_entries.append(entry)
+        
+        # Keep only recent entries
+        if len(self.log_entries) > self.max_entries:
+            self.log_entries = self.log_entries[-self.max_entries:]
     
     def get_recent_logs(self, lines: int = 50) -> List[str]:
         """Get recent log lines"""
-        if not self.log_file.exists():
-            return []
-        
-        try:
-            with open(self.log_file, 'r', encoding='utf-8') as f:
-                all_lines = f.readlines()
-                return [line.strip() for line in all_lines[-lines:]]
-        except Exception as e:
-            return [f"Error reading log: {e}"]
-    
-    def save_session_status(self, session: ProcessingSession):
-        """Save current session status"""
-        try:
-            with open(self.status_file, 'w') as f:
-                # Convert datetime to string for JSON serialization
-                session_dict = asdict(session)
-                session_dict['start_time'] = session.start_time.isoformat()
-                json.dump(session_dict, f, indent=2)
-        except Exception as e:
-            self.log("ERROR", f"Failed to save session status: {e}")
-    
-    def load_session_status(self) -> Optional[ProcessingSession]:
-        """Load session status if exists"""
-        try:
-            if self.status_file.exists():
-                with open(self.status_file, 'r') as f:
-                    data = json.load(f)
-                    data['start_time'] = datetime.fromisoformat(data['start_time'])
-                    return ProcessingSession(**data)
-        except Exception as e:
-            self.log("ERROR", f"Failed to load session status: {e}")
-        return None
+        return self.log_entries[-lines:] if self.log_entries else []
 
 class RateLimitedTranscriber:
     """Handles Deepgram API calls with rate limiting"""
@@ -213,43 +148,19 @@ class RateLimitedTranscriber:
             logger.error(f"Transcription error: {e}")
             return f"Transcription Failed: {str(e)}"
 
-class BatchProcessor:
-    """Handles large-scale batch processing of μ-law files with persistent logging"""
+class CloudBatchProcessor:
+    """Handles batch processing of uploaded μ-law files in Streamlit Cloud"""
     
     def __init__(self, transcriber: RateLimitedTranscriber, sample_rate: int = 8000, channels: int = 1):
         self.transcriber = transcriber
         self.sample_rate = sample_rate
         self.channels = channels
-        self.job_queue = queue.Queue()
         self.results = []
         self.stats = ProcessingStats()
         self.is_running = False
         self.should_stop = False
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.logger = PersistentLogger(self.session_id)
-        self.current_session = None
-        
-        # Try to recover previous session
-        self.recover_session()
-        
-    def recover_session(self):
-        """Try to recover a previous session"""
-        log_dir = Path("ulaw_logs")
-        if log_dir.exists():
-            # Find the most recent session
-            status_files = list(log_dir.glob("*_status.json"))
-            if status_files:
-                latest_file = max(status_files, key=lambda x: x.stat().st_mtime)
-                session_id = latest_file.stem.replace("_status", "").replace("session_", "")
-                
-                temp_logger = PersistentLogger(session_id)
-                recovered_session = temp_logger.load_session_status()
-                
-                if recovered_session and recovered_session.is_active:
-                    self.logger.log("INFO", f"Found previous session: {session_id}")
-                    self.session_id = session_id
-                    self.logger = temp_logger
-                    self.current_session = recovered_session
+        self.logger = InMemoryLogger(self.session_id)
         
     def ulaw_to_linear(self, ulaw_byte):
         """Convert a single μ-law byte to 16-bit linear PCM."""
@@ -272,51 +183,27 @@ class BatchProcessor:
         wav_buffer.seek(0)
         return wav_buffer.read()
     
-    def scan_directory(self, root_path: Path) -> List[ProcessingJob]:
-        """Scan directory for μ-law files and create processing jobs"""
-        jobs = []
-        ulaw_extensions = {'.ulaw', '.ul', '.au', '.raw'}
-        
-        for file_path in root_path.rglob('*'):
-            if file_path.is_file() and file_path.suffix.lower() in ulaw_extensions:
-                relative_path = file_path.relative_to(root_path)
-                parent_folder = str(relative_path.parent) if relative_path.parent != Path('.') else root_path.name
-                
-                job = ProcessingJob(
-                    file_path=file_path,
-                    relative_path=relative_path,
-                    parent_folder=parent_folder,
-                    file_name=file_path.name,
-                    file_size=file_path.stat().st_size
-                )
-                jobs.append(job)
-        
-        return sorted(jobs, key=lambda x: x.file_path)
-    
-    def process_single_file(self, job: ProcessingJob, progress_callback=None) -> ProcessingJob:
-        """Process a single μ-law file with detailed step tracking"""
+    def process_single_file(self, job: UploadedFileJob, progress_callback=None) -> UploadedFileJob:
+        """Process a single uploaded μ-law file with detailed step tracking"""
         start_time = time.time()
         step_times = {}
         
         try:
             job.status = "processing"
             
-            # Step 1: Reading μ-law file
+            # Step 1: Reading μ-law file (already in memory)
             step_start = time.time()
-            # Thread-safe progress callback
             if progress_callback:
                 try:
                     progress_callback("reading", job.file_name)
                 except:
-                    pass  # Ignore Streamlit context errors in background thread
+                    pass
             
-            self.logger.log("INFO", f"📖 Reading μ-law file: {job.parent_folder}/{job.file_name} ({job.file_size:,} bytes)")
-            
-            with open(job.file_path, 'rb') as f:
-                ulaw_data = f.read()
+            self.logger.log("INFO", f"📖 Processing uploaded file: {job.file_name} ({job.file_size:,} bytes)")
+            ulaw_data = job.file_data
             
             step_times['read'] = time.time() - step_start
-            self.logger.log("INFO", f"✅ File read complete ({step_times['read']:.2f}s)")
+            self.logger.log("INFO", f"✅ File data loaded ({step_times['read']:.2f}s)")
             
             # Step 2: Converting to WAV (this is the bottleneck!)
             step_start = time.time()
@@ -329,31 +216,12 @@ class BatchProcessor:
             self.logger.log("INFO", f"🔄 Converting μ-law to WAV: {len(ulaw_data):,} bytes to process...")
             
             wav_data = self.convert_ulaw_to_wav_bytes(ulaw_data, self.sample_rate, self.channels)
+            job.wav_data = wav_data
             
             step_times['convert'] = time.time() - step_start
             self.logger.log("INFO", f"✅ WAV conversion complete ({step_times['convert']:.2f}s) - Generated {len(wav_data):,} bytes")
             
-            # Step 3: Creating output directory and saving WAV
-            step_start = time.time()
-            if progress_callback:
-                try:
-                    progress_callback("saving_wav", job.file_name)
-                except:
-                    pass
-            
-            wav_dir = job.file_path.parent / "wav"
-            wav_dir.mkdir(exist_ok=True)
-            
-            wav_filename = job.file_path.stem + ".wav"
-            wav_path = wav_dir / wav_filename
-            with open(wav_path, 'wb') as f:
-                f.write(wav_data)
-            
-            job.wav_path = wav_path
-            step_times['save_wav'] = time.time() - step_start
-            self.logger.log("INFO", f"💾 WAV file saved: {wav_path} ({step_times['save_wav']:.2f}s)")
-            
-            # Step 4: Transcribing with Deepgram
+            # Step 3: Transcribing with Deepgram
             step_start = time.time()
             if progress_callback:
                 try:
@@ -376,9 +244,8 @@ class BatchProcessor:
             total_time = job.processing_time
             self.logger.log("SUCCESS", f"🎉 COMPLETED: {job.file_name}")
             self.logger.log("INFO", f"⏱️  TIMING BREAKDOWN:")
-            self.logger.log("INFO", f"   📖 Read file: {step_times['read']:.2f}s ({(step_times['read']/total_time)*100:.1f}%)")
+            self.logger.log("INFO", f"   📖 Load file: {step_times['read']:.2f}s ({(step_times['read']/total_time)*100:.1f}%)")
             self.logger.log("INFO", f"   🔄 Convert μ-law→WAV: {step_times['convert']:.2f}s ({(step_times['convert']/total_time)*100:.1f}%)")
-            self.logger.log("INFO", f"   💾 Save WAV: {step_times['save_wav']:.2f}s ({(step_times['save_wav']/total_time)*100:.1f}%)")
             self.logger.log("INFO", f"   🎤 Transcribe: {step_times['transcribe']:.2f}s ({(step_times['transcribe']/total_time)*100:.1f}%)")
             self.logger.log("INFO", f"   🏁 TOTAL: {total_time:.2f}s")
             
@@ -395,32 +262,22 @@ class BatchProcessor:
         
         return job
     
-    def process_batch(self, jobs: List[ProcessingJob], max_workers: int = 2, 
+    def process_batch(self, jobs: List[UploadedFileJob], max_workers: int = 2, 
                      progress_callback=None, status_callback=None, step_callback=None):
-        """Process a batch of jobs with thread-safe callbacks to avoid Streamlit context warnings"""
+        """Process a batch of uploaded files with thread-safe callbacks"""
         self.is_running = True
         self.should_stop = False
         self.results = []
         
-        # Thread-safe wrapper for step progress that won't cause Streamlit warnings
+        # Thread-safe wrapper for step progress
         def safe_step_progress_wrapper(step, filename):
             try:
                 self.stats.current_step = step
                 self.stats.step_start_time = datetime.now()
-                # Only call step_callback if it won't cause context issues
                 if step_callback:
                     step_callback(step, filename)
             except Exception:
-                # Silently ignore Streamlit context errors from background thread
                 pass
-        
-        # Create new session
-        self.current_session = ProcessingSession(
-            session_id=self.session_id,
-            start_time=datetime.now(),
-            total_files=len(jobs),
-            log_file=str(self.logger.log_file)
-        )
         
         self.logger.log("INFO", f"=== STARTING BATCH PROCESSING ===")
         self.logger.log("INFO", f"Session ID: {self.session_id}")
@@ -456,17 +313,13 @@ class BatchProcessor:
                         
                         # Update stats (thread-safe operations)
                         self.stats.processed += 1
-                        self.current_session.processed += 1
                         
                         if result.status == "completed":
                             self.stats.successful += 1
-                            self.current_session.successful += 1
                         else:
                             self.stats.failed += 1
-                            self.current_session.failed += 1
                         
                         self.stats.current_file = result.file_name
-                        self.current_session.current_file = result.file_name
                         self.stats.current_step = "completed"
                         
                         # Estimate completion time
@@ -477,11 +330,10 @@ class BatchProcessor:
                             eta_seconds = remaining_files * avg_time_per_file
                             self.stats.estimated_completion = datetime.now() + pd.Timedelta(seconds=eta_seconds)
                         
-                        # Save session status periodically
-                        if self.stats.processed % 10 == 0:  # Every 10 files
-                            self.logger.save_session_status(self.current_session)
+                        # Log progress periodically
+                        if self.stats.processed % 5 == 0:  # Every 5 files
                             remaining = self.stats.total_files - self.stats.processed
-                            self.logger.log("INFO", f"📊 PROGRESS UPDATE: {self.stats.processed}/{self.stats.total_files} ({(self.stats.processed/self.stats.total_files)*100:.1f}%) - {remaining} files remaining")
+                            self.logger.log("INFO", f"📊 PROGRESS: {self.stats.processed}/{self.stats.total_files} ({(self.stats.processed/self.stats.total_files)*100:.1f}%) - {remaining} files remaining")
                         
                         # Thread-safe callback calls
                         try:
@@ -490,7 +342,6 @@ class BatchProcessor:
                             if status_callback:
                                 status_callback(result)
                         except Exception:
-                            # Ignore Streamlit context errors from background thread
                             pass
                             
                     except Exception as e:
@@ -501,67 +352,54 @@ class BatchProcessor:
                         
         finally:
             self.is_running = False
-            self.current_session.is_active = False
-            self.logger.save_session_status(self.current_session)
-            
             self.logger.log("INFO", f"=== BATCH PROCESSING COMPLETED ===")
             self.logger.log("INFO", f"Total processed: {self.stats.processed}")
             self.logger.log("INFO", f"Successful: {self.stats.successful}")
             self.logger.log("INFO", f"Failed: {self.stats.failed}")
-            
-            # Auto-save results when processing completes
-            if self.results:
-                try:
-                    auto_save_path = self.export_results_to_csv(Path("temp.csv"), auto_save=True)
-                    if auto_save_path:
-                        self.logger.log("SUCCESS", f"Results auto-saved to: {auto_save_path}")
-                except Exception as e:
-                    self.logger.log("ERROR", f"Error auto-saving results: {e}")
     
     def stop_processing(self):
         """Stop the current processing"""
         self.should_stop = True
     
-    def export_results_to_csv(self, output_path: Path, auto_save: bool = True):
-        """Export all results to a CSV file"""
+    def export_results_to_csv(self) -> bytes:
+        """Export all results to CSV and return as bytes"""
         if not self.results:
-            return None
+            return b""
         
         # Convert results to DataFrame
         data = []
         for result in self.results:
             data.append({
-                'Parent Folder': result.parent_folder,
                 'File Name': result.file_name,
-                'Relative Path': str(result.relative_path),
                 'Status': result.status,
                 'Transcript': result.transcript,
                 'Processing Time (s)': round(result.processing_time, 2),
                 'File Size (bytes)': result.file_size,
-                'WAV Path': str(result.wav_path) if result.wav_path else "",
                 'Error Message': result.error_message,
                 'Processed At': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             })
         
         df = pd.DataFrame(data)
+        return df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+    
+    def create_wav_zip(self) -> bytes:
+        """Create a ZIP file containing all converted WAV files"""
+        if not self.results:
+            return b""
         
-        # Save CSV
-        df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for result in self.results:
+                if result.wav_data and result.status == "completed":
+                    wav_filename = Path(result.file_name).stem + ".wav"
+                    zip_file.writestr(wav_filename, result.wav_data)
         
-        if auto_save:
-            # Also create an auto-save copy with timestamp
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            auto_save_dir = Path("ulaw_results")
-            auto_save_dir.mkdir(exist_ok=True)
-            auto_save_path = auto_save_dir / f"transcription_results_{timestamp}.csv"
-            df.to_csv(auto_save_path, index=False, encoding='utf-8-sig')
-            return auto_save_path
-        
-        return output_path
+        zip_buffer.seek(0)
+        return zip_buffer.read()
 
 def main():
     st.set_page_config(
-        page_title="Enhanced μ-law Batch Processor",
+        page_title="μ-law Converter & Transcriber - Cloud Edition",
         page_icon="🎵",
         layout="wide"
     )
@@ -583,139 +421,160 @@ def main():
     </style>
     """, unsafe_allow_html=True)
     
-    st.title("🎵 Enhanced μ-law Batch Processor")
-    st.markdown("Large-scale μ-law to WAV conversion with transcription and consolidated reporting.")
+    st.title("🎵 μ-law Converter & Transcriber - Cloud Edition")
+    st.markdown("Upload μ-law files for conversion to WAV and AI transcription. Works with single files or batches.")
     
     # Get API key
     try:
         api_key = st.secrets["DEEPGRAM_API_KEY"]
     except (FileNotFoundError, KeyError):
-        st.warning("DEEPGRAM_API_KEY not found in secrets.toml. Transcription will be disabled.", icon="⚠️")
+        st.warning("DEEPGRAM_API_KEY not found in secrets. Transcription will be disabled.", icon="⚠️")
         api_key = None
 
     # Initialize session state
     if 'processor' not in st.session_state:
         transcriber = RateLimitedTranscriber(api_key)
-        st.session_state.processor = BatchProcessor(transcriber)
+        st.session_state.processor = CloudBatchProcessor(transcriber)
     
     if 'processing_stats' not in st.session_state:
         st.session_state.processing_stats = ProcessingStats()
-    
-    if 'current_jobs' not in st.session_state:
-        st.session_state.current_jobs = []
-    
-    if 'show_logs' not in st.session_state:
-        st.session_state.show_logs = False
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Directory Processing & Logs", "Job Monitoring", "Results", "Settings"])
+    tab1, tab2, tab3, tab4 = st.tabs(["File Upload & Processing", "Job Monitoring", "Results", "Settings"])
     
     with tab1:
-        st.header("Large-Scale Directory Processing")
+        st.header("Upload μ-law Files")
         
-        # Session recovery notice
-        if st.session_state.processor.current_session and st.session_state.processor.current_session.is_active:
-            st.info(f"🔄 Recovered session: {st.session_state.processor.session_id}")
-        
-        # Directory selection
-        st.markdown("### 📁 Select Root Directory")
-        directory_path = st.text_input(
-            "Root Directory Path",
-            placeholder="Enter the path to your directory containing μ-law files",
-            help="Path to the directory containing subdirectories with .ulaw files"
+        # File upload options
+        upload_option = st.radio(
+            "Choose upload method:",
+            ["Single File", "Multiple Files (Batch)"],
+            horizontal=True
         )
         
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if st.button("🔍 Scan Directory", type="primary"):
-                if directory_path and Path(directory_path).exists():
-                    with st.spinner("Scanning directory for μ-law files..."):
-                        jobs = st.session_state.processor.scan_directory(Path(directory_path))
-                        st.session_state.current_jobs = jobs
-                    
-                    if jobs:
-                        st.success(f"Found {len(jobs)} μ-law files across {len(set(job.parent_folder for job in jobs))} directories")
-                        
-                        # Show directory structure preview
-                        folder_counts = {}
-                        for job in jobs:
-                            folder_counts[job.parent_folder] = folder_counts.get(job.parent_folder, 0) + 1
-                        
-                        st.markdown("### 📊 Directory Structure")
-                        structure_df = pd.DataFrame([
-                            {"Folder": folder, "File Count": count}
-                            for folder, count in sorted(folder_counts.items())
-                        ])
-                        st.dataframe(structure_df, use_container_width=True)
-                    else:
-                        st.warning("No μ-law files found in the specified directory.")
-                else:
-                    st.error("Please enter a valid directory path.")
+        uploaded_files = []
         
-        with col2:
-            # Reduced max_workers for stability with large batches
-            if st.button("▶️ Start Processing", disabled=not st.session_state.current_jobs):
-                if st.session_state.current_jobs and not st.session_state.processor.is_running:
-                    st.session_state.processing_stats = ProcessingStats()
-                    st.session_state.show_logs = True
+        if upload_option == "Single File":
+            st.markdown("### 📁 Upload Single File")
+            uploaded_file = st.file_uploader(
+                "Choose a μ-law file",
+                type=['ulaw', 'ul', 'au', 'raw'],
+                help="Select a μ-law encoded audio file"
+            )
+            if uploaded_file:
+                uploaded_files = [uploaded_file]
+        
+        else:  # Batch upload
+            st.markdown("### 📁 Upload Multiple Files")
+            uploaded_files = st.file_uploader(
+                "Choose multiple μ-law files",
+                type=['ulaw', 'ul', 'au', 'raw'],
+                accept_multiple_files=True,
+                help="Select multiple μ-law files for batch processing"
+            )
+        
+        # Audio settings
+        if uploaded_files:
+            st.markdown("### ⚙️ Audio Settings")
+            col1, col2 = st.columns(2)
+            with col1:
+                sample_rate = st.selectbox("Sample Rate (Hz)", [8000, 16000, 22050, 44100, 48000], 0, help="Most μ-law files use 8000 Hz")
+            with col2:
+                channels = st.radio("Channels", [1, 2], 0, format_func=lambda x: "Mono" if x == 1 else "Stereo", help="Most μ-law files are mono")
+            
+            # Update processor settings
+            st.session_state.processor.sample_rate = sample_rate
+            st.session_state.processor.channels = channels
+            
+            # Show file info
+            st.markdown("### 📊 Uploaded Files")
+            total_size = sum(f.size for f in uploaded_files)
+            st.info(f"📁 {len(uploaded_files)} file(s) uploaded • Total size: {total_size:,} bytes ({total_size/1024/1024:.1f} MB)")
+            
+            # File list
+            if len(uploaded_files) > 1:
+                file_data = []
+                for f in uploaded_files:
+                    file_data.append({
+                        "File Name": f.name,
+                        "Size (KB)": f"{f.size/1024:.1f}",
+                        "Type": f.type or "μ-law audio"
+                    })
+                st.dataframe(pd.DataFrame(file_data), use_container_width=True)
+            
+            # Processing controls
+            st.markdown("### 🎛️ Processing Controls")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("🚀 Start Processing", type="primary", disabled=st.session_state.processor.is_running):
+                    # Convert uploaded files to processing jobs
+                    jobs = []
+                    for uploaded_file in uploaded_files:
+                        file_data = uploaded_file.read()
+                        job = UploadedFileJob(
+                            file_name=uploaded_file.name,
+                            file_data=file_data,
+                            file_size=uploaded_file.size
+                        )
+                        jobs.append(job)
+                        # Reset file pointer for potential reuse
+                        uploaded_file.seek(0)
                     
-                    # Start processing in background with fewer workers for large batches
-                    max_workers = 2 if len(st.session_state.current_jobs) > 100 else 4
+                    # Start processing
+                    st.session_state.processing_stats = ProcessingStats()
+                    
+                    # Determine optimal workers based on file count
+                    max_workers = min(2, len(jobs)) if len(jobs) > 20 else min(4, len(jobs))
                     
                     def progress_callback(stats):
-                        # Thread-safe update of session state
                         try:
                             st.session_state.processing_stats = stats
                         except Exception:
-                            # Ignore context errors - will be picked up on next refresh
                             pass
                     
                     def status_callback(result):
-                        # Minimal callback to avoid context issues
                         pass
                     
                     def step_callback(step, filename):
-                        # Thread-safe step tracking
                         try:
-                            if not hasattr(st.session_state, 'current_step_info'):
-                                st.session_state.current_step_info = {}
                             st.session_state.current_step_info = {
                                 'step': step, 
                                 'filename': filename,
                                 'timestamp': datetime.now()
                             }
                         except Exception:
-                            # Ignore context errors
                             pass
                     
                     threading.Thread(
                         target=st.session_state.processor.process_batch,
-                        args=(st.session_state.current_jobs, max_workers, progress_callback, status_callback, step_callback),
+                        args=(jobs, max_workers, progress_callback, status_callback, step_callback),
                         daemon=True
                     ).start()
                     
-                    st.success("Processing started! Monitor detailed progress below. Results will be auto-saved when complete.")
-                    st.info("ℹ️ Note: Any 'ScriptRunContext' warnings in the terminal are normal and can be ignored.")
+                    st.success("🚀 Processing started! Monitor progress below.")
+                    st.info("ℹ️ Note: Processing happens in the cloud. All files are processed in memory.")
+                    st.rerun()
+            
+            with col2:
+                if st.button("⏹️ Stop Processing", disabled=not st.session_state.processor.is_running):
+                    st.session_state.processor.stop_processing()
+                    st.warning("⏹️ Processing stopped.")
                     st.rerun()
         
-        with col3:
-            if st.button("⏹️ Stop Processing", disabled=not st.session_state.processor.is_running):
-                st.session_state.processor.stop_processing()
-                st.warning("Processing stopped.")
-                st.rerun()
-        
-        # Real-time processing status and logs
-        if st.session_state.show_logs or st.session_state.processor.is_running:
+        # Real-time processing status
+        if st.session_state.processor.is_running or st.session_state.processor.results:
             st.markdown("---")
-            st.markdown("### 📊 Real-time Processing Status")
+            st.markdown("### 📊 Processing Status")
             
             # Auto-refresh during processing
             if st.session_state.processor.is_running:
                 time.sleep(2)
                 st.rerun()
             
-            # Current stats
             stats = st.session_state.processing_stats
+            
             if stats.total_files > 0:
+                # Progress metrics
                 col1, col2, col3, col4 = st.columns(4)
                 
                 with col1:
@@ -732,182 +591,91 @@ def main():
                     progress = stats.processed / stats.total_files
                     st.progress(progress, text=f"Progress: {progress:.1%}")
                 
-                # Current file and timing
+                # Current step information
                 if stats.current_file:
-                    # Show current step with detailed info
                     step_display = {
-                        "reading": "📖 Reading μ-law file",
-                        "converting": "🔄 Converting μ-law to WAV (bottleneck step)",
-                        "saving_wav": "💾 Saving WAV file",
-                        "transcribing": "🎤 Transcribing with Deepgram",
+                        "reading": "📖 Loading file data",
+                        "converting": "🔄 Converting μ-law to WAV (main processing step)",
+                        "transcribing": "🎤 Transcribing with Deepgram AI",
                         "completed": "✅ File completed",
                         "failed": "❌ Processing failed"
                     }
                     
                     current_step_text = step_display.get(stats.current_step, stats.current_step)
                     
-                    # Calculate step duration if available
-                    step_duration = ""
-                    if stats.step_start_time and stats.current_step in ["reading", "converting", "saving_wav", "transcribing"]:
-                        step_elapsed = (datetime.now() - stats.step_start_time).total_seconds()
-                        step_duration = f" ({step_elapsed:.1f}s elapsed)"
-                    
                     if stats.current_step == "converting":
                         st.warning(f"🔄 **Currently processing:** {stats.current_file}")
-                        st.info(f"⚙️ **Step:** {current_step_text}{step_duration}")
-                        st.markdown("💡 **Note:** μ-law to WAV conversion is typically the slowest step")
+                        st.info(f"⚙️ **Step:** {current_step_text}")
+                        st.markdown("💡 **Note:** μ-law to WAV conversion is the most time-consuming step")
                     else:
                         st.info(f"🔄 **Currently processing:** {stats.current_file}")
-                        st.info(f"⚙️ **Step:** {current_step_text}{step_duration}")
+                        st.info(f"⚙️ **Step:** {current_step_text}")
                 
+                # Timing information
                 if stats.start_time:
                     elapsed = datetime.now() - stats.start_time
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.markdown(f"**⏱️ Total Elapsed:** {str(elapsed).split('.')[0]}")
+                        st.markdown(f"**⏱️ Elapsed:** {str(elapsed).split('.')[0]}")
                     with col2:
                         if stats.estimated_completion and stats.processed > 0:
                             eta = stats.estimated_completion - datetime.now()
                             if eta.total_seconds() > 0:
                                 st.markdown(f"**⏳ ETA:** {str(eta).split('.')[0]}")
                     
-                    # Show processing rate
+                    # Processing rate
                     if stats.processed > 0:
                         files_per_minute = (stats.processed / elapsed.total_seconds()) * 60
-                        st.markdown(f"**📈 Processing Rate:** {files_per_minute:.1f} files/minute")
+                        st.markdown(f"**📈 Rate:** {files_per_minute:.1f} files/minute")
             
-            # Real-time logs
+            # Live logs
             st.markdown("### 📝 Processing Logs")
             
             # Performance tips
             if st.session_state.processor.is_running:
-                st.markdown("### 💡 Performance Information")
-                with st.expander("Understanding Processing Steps", expanded=False):
+                with st.expander("💡 Understanding Cloud Processing", expanded=False):
                     st.markdown("""
-                    **Processing Pipeline for each file:**
+                    **Cloud Processing Pipeline:**
                     
-                    1. **📖 Read File** (Fast) - Read μ-law data from disk
-                    2. **🔄 Convert μ-law→WAV** (Slowest) - Mathematical conversion of audio data
-                    3. **💾 Save WAV** (Fast) - Write converted audio to disk  
-                    4. **🎤 Transcribe** (Medium) - Upload to Deepgram API and get transcript
+                    1. **📖 Load File** - File data loaded from upload
+                    2. **🔄 Convert μ-law→WAV** - CPU-intensive conversion step
+                    3. **🎤 Transcribe** - AI transcription via Deepgram API
                     
-                    **Why conversion is slow:**
-                    - Each μ-law byte must be converted using a lookup table
-                    - Large files require processing millions of audio samples
-                    - This is CPU-intensive work done on your local machine
-                    - Deepgram transcription is much faster as it's optimized for this task
-                    
-                    **Tips for better performance:**
-                    - Close other CPU-intensive applications
-                    - Processing speed depends on your CPU and file sizes
-                    - Multiple workers help, but too many can overwhelm your system
+                    **Cloud Benefits:**
+                    - No local file system required
+                    - Scalable processing power
+                    - Secure - files processed in memory only
+                    - Results available for immediate download
                     """)
             
-            # Log controls
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                log_lines = st.slider("Number of log lines to show", 10, 200, 50)
-            with col2:
-                if st.button("🔄 Refresh Logs"):
-                    st.rerun()
-            
-            # Get and display logs
+            # Log display
             if hasattr(st.session_state.processor, 'logger'):
-                recent_logs = st.session_state.processor.logger.get_recent_logs(log_lines)
+                recent_logs = st.session_state.processor.logger.get_recent_logs(30)
                 
                 if recent_logs:
-                    # Create a container for logs with styling
-                    log_container = st.container()
-                    with log_container:
-                        # Display logs in a code block for better formatting
-                        log_text = "\n".join(recent_logs)
-                        
-                        # Color code different log levels
-                        log_display = ""
-                        for line in recent_logs:
-                            if "ERROR" in line:
-                                log_display += f"🔴 {line}\n"
-                            elif "✅" in line or "SUCCESS" in line:
-                                log_display += f"🟢 {line}\n"
-                            elif "WARNING" in line:
-                                log_display += f"🟡 {line}\n"
-                            else:
-                                log_display += f"ℹ️ {line}\n"
-                        
-                        st.text_area(
-                            "Recent Activity",
-                            log_display,
-                            height=300,
-                            help="Live log feed - refreshes automatically during processing"
-                        )
-                        
-                        # Log file info
-                        log_file_path = st.session_state.processor.logger.log_file
-                        st.markdown(f"📄 **Full log file:** `{log_file_path}`")
+                    log_display = ""
+                    for line in recent_logs:
+                        if "ERROR" in line:
+                            log_display += f"🔴 {line}\n"
+                        elif "✅" in line or "SUCCESS" in line:
+                            log_display += f"🟢 {line}\n"
+                        elif "WARNING" in line:
+                            log_display += f"🟡 {line}\n"
+                        else:
+                            log_display += f"ℹ️ {line}\n"
+                    
+                    st.text_area(
+                        "Recent Activity",
+                        log_display,
+                        height=200,
+                        help="Live processing log - updates automatically"
+                    )
                 else:
-                    st.info("No logs available yet. Start processing to see activity.")
-            
-            # Processing summary when not running
-            if not st.session_state.processor.is_running and st.session_state.processor.results:
-                st.markdown("### ✅ Processing Complete")
-                results = st.session_state.processor.results
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Total Processed", len(results))
-                with col2:
-                    successful = len([r for r in results if r.status == "completed"])
-                    st.metric("Successful", successful)
-                with col3:
-                    success_rate = (successful / len(results)) * 100 if results else 0
-                    st.metric("Success Rate", f"{success_rate:.1f}%")
-                
-                if st.button("📋 View Full Results", type="secondary"):
-                    st.session_state.show_logs = False
-                    st.rerun()
+                    st.info("No processing logs yet. Start processing to see activity.")
     
     with tab2:
         st.header("📊 Job Monitoring")
         
-        # Auto-refresh every 2 seconds during processing
-        if st.session_state.processor.is_running:
-            time.sleep(2)
-            st.rerun()
-        
-        stats = st.session_state.processing_stats
-        
-        if stats.total_files > 0:
-            # Progress metrics
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("Total Files", stats.total_files)
-            with col2:
-                st.metric("Processed", f"{stats.processed}/{stats.total_files}")
-            with col3:
-                st.metric("Successful", stats.successful, delta=stats.successful - stats.failed)
-            with col4:
-                st.metric("Failed", stats.failed)
-            
-            # Progress bar
-            if stats.total_files > 0:
-                progress = stats.processed / stats.total_files
-                st.progress(progress, text=f"Progress: {progress:.1%}")
-            
-            # Current status
-            if stats.current_file:
-                st.info(f"Currently processing: {stats.current_file}")
-            
-            # Time estimates
-            if stats.start_time:
-                elapsed = datetime.now() - stats.start_time
-                st.markdown(f"**Elapsed Time:** {str(elapsed).split('.')[0]}")
-                
-                if stats.estimated_completion and stats.processed > 0:
-                    eta = stats.estimated_completion - datetime.now()
-                    if eta.total_seconds() > 0:
-                        st.markdown(f"**Estimated Time Remaining:** {str(eta).split('.')[0]}")
-        
-        # Real-time results table (last 10 processed files)
         if st.session_state.processor.results:
             st.markdown("### 📋 Recent Results")
             recent_results = st.session_state.processor.results[-10:]
@@ -922,142 +690,129 @@ def main():
                 
                 display_data.append({
                     "Status": f"{status_emoji} {result.status.title()}",
-                    "Folder": result.parent_folder,
                     "File": result.file_name,
-                    "Size": f"{result.file_size:,} bytes",
-                    "Time": f"{result.processing_time:.1f}s",
+                    "Size (KB)": f"{result.file_size/1024:.1f}",
+                    "Time (s)": f"{result.processing_time:.1f}",
                     "Transcript Preview": result.transcript[:50] + "..." if len(result.transcript) > 50 else result.transcript
                 })
             
             st.dataframe(pd.DataFrame(display_data), use_container_width=True)
+        else:
+            st.info("No processing results yet. Upload and process some files first!")
+        
+        # System status
+        st.markdown("### 🖥️ System Status")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if api_key:
+                st.success("✅ Deepgram API")
+            else:
+                st.error("❌ Deepgram API")
+        
+        with col2:
+            if st.session_state.processor.is_running:
+                st.warning("🔄 Processing Active")
+            else:
+                st.success("✅ Ready")
+        
+        with col3:
+            session_id = st.session_state.processor.session_id
+            st.info(f"🆔 Session: {session_id}")
     
     with tab3:
-        st.header("📄 Results & Export")
+        st.header("📄 Results & Downloads")
         
         if st.session_state.processor.results:
-            st.markdown(f"### 📊 Processing Summary")
-            
             results = st.session_state.processor.results
             total_processed = len(results)
             successful = len([r for r in results if r.status == "completed"])
             failed = len([r for r in results if r.status == "failed"])
             
+            # Summary metrics
+            st.markdown("### 📊 Processing Summary")
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Total Processed", total_processed)
             with col2:
                 st.metric("Successful", successful, delta=successful - failed)
             with col3:
-                st.metric("Success Rate", f"{(successful/total_processed)*100:.1f}%")
+                success_rate = (successful / total_processed) * 100 if total_processed > 0 else 0
+                st.metric("Success Rate", f"{success_rate:.1f}%")
             
-            # Export options
-            st.markdown("### 💾 Export Results")
-            st.info("📁 Results are automatically saved to the 'ulaw_results' directory")
+            # Download options
+            st.markdown("### 💾 Download Results")
             
-            # Manual CSV export
-            if st.button("📄 Download CSV Report", type="primary"):
-                try:
-                    results_df = pd.DataFrame([
-                        {
-                            'Parent Folder': r.parent_folder,
-                            'File Name': r.file_name,
-                            'Relative Path': str(r.relative_path),
-                            'Status': r.status,
-                            'Transcript': r.transcript,
-                            'Processing Time (s)': round(r.processing_time, 2),
-                            'File Size (bytes)': r.file_size,
-                            'WAV Path': str(r.wav_path) if r.wav_path else "",
-                            'Error Message': r.error_message,
-                            'Processed At': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        }
-                        for r in results
-                    ])
-                    
-                    csv_data = results_df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # CSV download
+                csv_data = st.session_state.processor.export_results_to_csv()
+                if csv_data:
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"ulaw_transcription_results_{timestamp}.csv"
                     
                     st.download_button(
-                        "📥 Download CSV File",
+                        "📊 Download Transcription Results (CSV)",
                         csv_data,
                         filename,
                         "text/csv",
-                        use_container_width=True
+                        use_container_width=True,
+                        type="primary"
                     )
-                    
-                except Exception as e:
-                    st.error(f"Error creating CSV file: {e}")
             
-            # Auto-save status
-            auto_save_dir = Path("ulaw_results")
-            if auto_save_dir.exists():
-                csv_files = list(auto_save_dir.glob("*.csv"))
-                if csv_files:
-                    st.markdown("### 📂 Auto-saved Files")
-                    st.markdown(f"**Location:** `{auto_save_dir.absolute()}`")
-                    
-                    # Show recent auto-saved files
-                    recent_files = sorted(csv_files, key=lambda x: x.stat().st_mtime, reverse=True)[:5]
-                    for file_path in recent_files:
-                        mod_time = datetime.fromtimestamp(file_path.stat().st_mtime)
-                        st.markdown(f"- `{file_path.name}` (saved: {mod_time.strftime('%Y-%m-%d %H:%M:%S')})")
-                    
-                    if len(csv_files) > 5:
-                        st.markdown(f"... and {len(csv_files) - 5} more files")
-            
-            # Quick auto-save current results
-            if st.button("💾 Save Current Results", type="secondary"):
-                try:
-                    auto_save_path = st.session_state.processor.export_results_to_csv(
-                        Path("temp.csv"), auto_save=True
-                    )
-                    if auto_save_path:
-                        st.success(f"✅ Results auto-saved to: `{auto_save_path}`")
-                    else:
-                        st.warning("No results to save.")
-                except Exception as e:
-                    st.error(f"Error auto-saving: {e}")
-            
-            # Results table with filtering
-            st.markdown("### 🔍 Detailed Results")
-            
-            # Filters
-            col1, col2 = st.columns(2)
-            with col1:
-                status_filter = st.selectbox("Filter by Status", ["All", "Completed", "Failed"])
             with col2:
-                folder_filter = st.selectbox(
-                    "Filter by Folder",
-                    ["All"] + sorted(set(r.parent_folder for r in results))
-                )
+                # WAV files ZIP download
+                zip_data = st.session_state.processor.create_wav_zip()
+                if zip_data:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    zip_filename = f"converted_wav_files_{timestamp}.zip"
+                    
+                    st.download_button(
+                        "🎵 Download WAV Files (ZIP)",
+                        zip_data,
+                        zip_filename,
+                        "application/zip",
+                        use_container_width=True,
+                        type="secondary"
+                    )
             
-            # Apply filters
-            filtered_results = results
-            if status_filter != "All":
-                filtered_results = [r for r in filtered_results if r.status == status_filter.lower()]
-            if folder_filter != "All":
-                filtered_results = [r for r in filtered_results if r.parent_folder == folder_filter]
+            # Individual file previews
+            st.markdown("### 🎧 Individual File Results")
             
-            # Display filtered results
-            if filtered_results:
-                display_df = pd.DataFrame([
-                    {
-                        'Folder': r.parent_folder,
-                        'File': r.file_name,
-                        'Status': r.status.title(),
-                        'Size (KB)': f"{r.file_size/1024:.1f}",
-                        'Time (s)': f"{r.processing_time:.1f}",
-                        'Transcript': r.transcript[:100] + "..." if len(r.transcript) > 100 else r.transcript,
-                        'Error': r.error_message[:50] + "..." if len(r.error_message) > 50 else r.error_message
-                    }
-                    for r in filtered_results
-                ])
-                
-                st.dataframe(display_df, use_container_width=True, height=400)
-            else:
-                st.info("No results match the current filters.")
+            for i, result in enumerate(results):
+                with st.expander(f"📁 {result.file_name} ({result.status})", expanded=False):
+                    col1, col2 = st.columns([2, 1])
+                    
+                    with col1:
+                        st.markdown(f"**Status:** {result.status}")
+                        st.markdown(f"**Processing Time:** {result.processing_time:.2f}s")
+                        st.markdown(f"**File Size:** {result.file_size:,} bytes")
+                        
+                        if result.transcript:
+                            st.markdown("**Transcript:**")
+                            st.text_area("", result.transcript, height=100, key=f"transcript_{i}")
+                        
+                        if result.error_message:
+                            st.error(f"Error: {result.error_message}")
+                    
+                    with col2:
+                        if result.wav_data and result.status == "completed":
+                            st.markdown("**Audio Preview:**")
+                            st.audio(result.wav_data, format='audio/wav')
+                            
+                            # Individual WAV download
+                            wav_filename = Path(result.file_name).stem + ".wav"
+                            st.download_button(
+                                "📥 Download WAV",
+                                result.wav_data,
+                                wav_filename,
+                                "audio/wav",
+                                key=f"wav_download_{i}",
+                                use_container_width=True
+                            )
         else:
-            st.info("No results available. Start processing some files first!")
+            st.info("No results available. Upload and process some files first!")
     
     with tab4:
         st.header("⚙️ Settings & Configuration")
@@ -1066,35 +821,9 @@ def main():
         
         with col1:
             st.markdown("### 🎛️ Audio Settings")
-            new_sample_rate = st.selectbox(
-                "Sample Rate (Hz)",
-                [8000, 16000, 22050, 44100, 48000],
-                index=0,
-                help="Most μ-law files use 8000 Hz"
-            )
+            st.info("Audio settings are configured per processing session in the main tab.")
             
-            new_channels = st.radio(
-                "Channels",
-                [1, 2],
-                format_func=lambda x: "Mono" if x == 1 else "Stereo",
-                help="Most μ-law files are mono"
-            )
-            
-            if st.button("Apply Audio Settings"):
-                st.session_state.processor.sample_rate = new_sample_rate
-                st.session_state.processor.channels = new_channels
-                st.success("Audio settings updated!")
-        
-        with col2:
             st.markdown("### 🔄 Processing Settings")
-            
-            max_workers = st.slider(
-                "Max Concurrent Workers",
-                min_value=1,
-                max_value=6,
-                value=2,
-                help="Number of files processed simultaneously (reduced for stability with large batches)"
-            )
             
             rate_limit = st.slider(
                 "API Rate Limit (calls/minute)",
@@ -1104,77 +833,69 @@ def main():
                 help="Deepgram API calls per minute"
             )
             
-            if st.button("Apply Processing Settings"):
+            if st.button("Apply Rate Limit"):
                 if hasattr(st.session_state.processor.transcriber, 'max_calls_per_minute'):
                     st.session_state.processor.transcriber.max_calls_per_minute = rate_limit
-                st.success("Processing settings updated!")
+                st.success("Rate limit updated!")
         
-        # System information
-        st.markdown("### 📊 System Information")
+        with col2:
+            st.markdown("### 📊 System Information")
+            
+            if api_key:
+                st.success("✅ Deepgram API key configured")
+            else:
+                st.error("❌ Deepgram API key not found")
+            
+            st.info("🌐 Running in Streamlit Cloud")
+            st.info("💾 Files processed in memory (secure)")
+            st.info("🔒 No files stored on server")
+            
+            # Current session info
+            session_id = st.session_state.processor.session_id
+            st.markdown(f"**Current Session:** `{session_id}`")
         
-        if api_key:
-            st.success("✅ Deepgram API key configured")
-        else:
-            st.error("❌ Deepgram API key not found")
+        # Reset options
+        st.markdown("### 🔄 Reset Options")
         
-        st.info(f"📁 Current working directory: {os.getcwd()}")
-        st.info(f"💾 Auto-save directory: {Path('ulaw_results').absolute()}")
-        st.info(f"📝 Log directory: {Path('ulaw_logs').absolute()}")
+        col1, col2 = st.columns(2)
         
-        # Show auto-save directory status
-        auto_save_dir = Path("ulaw_results")
-        if auto_save_dir.exists():
-            csv_count = len(list(auto_save_dir.glob("*.csv")))
-            st.success(f"📂 Auto-save directory exists with {csv_count} saved CSV files")
-        else:
-            st.warning("📂 Auto-save directory will be created when first results are saved")
+        with col1:
+            if st.button("🗑️ Clear Results", type="secondary"):
+                st.session_state.processor.results = []
+                st.session_state.processing_stats = ProcessingStats()
+                st.success("Results cleared!")
+                st.rerun()
         
-        # Show log directory status
-        log_dir = Path("ulaw_logs")
-        if log_dir.exists():
-            log_count = len(list(log_dir.glob("*.log")))
-            session_count = len(list(log_dir.glob("*_status.json")))
-            st.success(f"📝 Log directory exists with {log_count} log files and {session_count} session files")
-        else:
-            st.warning("📝 Log directory will be created when processing starts")
+        with col2:
+            if st.button("🔄 Reset Session", type="secondary"):
+                # Reinitialize processor
+                transcriber = RateLimitedTranscriber(api_key)
+                st.session_state.processor = CloudBatchProcessor(transcriber)
+                st.session_state.processing_stats = ProcessingStats()
+                st.success("Session reset!")
+                st.rerun()
         
-        # Current session info
-        if hasattr(st.session_state.processor, 'session_id'):
-            st.markdown(f"**Current Session:** `{st.session_state.processor.session_id}`")
-        
-        # Thread safety info
-        st.markdown("### 🔧 Technical Information")
-        with st.expander("About Thread Safety & Warnings", expanded=False):
+        # Cloud-specific information
+        st.markdown("### ☁️ Cloud Processing Information")
+        with st.expander("How it works in the cloud", expanded=False):
             st.markdown("""
-            **Background Processing:**
-            - File processing runs in background threads to avoid blocking the UI
-            - Thread-safe logging prevents Streamlit context warnings
-            - All errors are handled gracefully without affecting functionality
+            **Streamlit Cloud Advantages:**
+            - 🔒 **Secure**: Files are processed in memory and never stored on disk
+            - 🚀 **Scalable**: Uses cloud computing resources for processing
+            - 🌍 **Accessible**: Works from any device with a web browser
+            - 💾 **No Storage**: All results are provided as downloads
             
-            **Terminal Warnings:**
-            - Any "missing ScriptRunContext" warnings can be safely ignored
-            - These are handled internally and don't affect processing
-            - The app is designed to work correctly even with these warnings
+            **File Processing:**
+            - Upload files directly through the web interface
+            - Files are processed entirely in memory
+            - Results are available for immediate download
+            - No local file system access required
             
-            **Performance Notes:**
-            - Processing continues even if the web interface refreshes
-            - Session state is preserved and can be recovered
-            - Logs are written to files for persistence
+            **Limitations:**
+            - File size limited by Streamlit Cloud memory constraints
+            - Processing power depends on cloud resources
+            - Session data is temporary (clears on restart)
             """)
-            
-        # Clear all warnings from terminal
-        if st.button("🧹 Clear Terminal Warnings", help="Restart processor to clear any accumulated warnings"):
-            # Reinitialize processor to clear any thread context issues
-            transcriber = RateLimitedTranscriber(api_key)
-            st.session_state.processor = BatchProcessor(transcriber)
-            st.success("✅ Processor reinitialized - terminal warnings should be cleared")
-        
-        # Clear session data
-        st.markdown("### 🗑️ Reset Data")
-        if st.button("Clear All Data", type="secondary"):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.success("All data cleared! Please refresh the page.")
 
 if __name__ == '__main__':
     main()

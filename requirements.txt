@@ -1,0 +1,7 @@
+# Core dependencies for μ-law processor
+streamlit>=1.28.0
+pandas>=2.0.0
+deepgram-sdk>=3.0.0
+
+# Optional: For better performance
+numpy>=1.24.0
